@@ -22,3 +22,23 @@ export interface Entity {
   value: string;
   description: string;
 }
+
+export interface AIConfig {
+  apiKey: string;
+  models: {
+    webSearch: string;
+    comprehensiveSummary: string;
+    dataset: string;
+    reviewReport: string;
+    followUpQuestions: string;
+    skillMd: string;
+  };
+  prompts: {
+    webSearch: string;
+    comprehensiveSummary: string;
+    dataset: string;
+    reviewReport: string;
+    followUpQuestions: string;
+    skillMd: string;
+  };
+}

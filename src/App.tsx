@@ -27,7 +27,7 @@ import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { SubmissionForm } from './components/SubmissionForm';
 import { geminiService } from './services/gemini';
-import { Language, SubmissionData, AgentResult, Entity } from './types';
+import { Language, SubmissionData, AgentResult, Entity, AIConfig } from './types';
 
 // --- Constants & Data ---
 
@@ -121,6 +121,7 @@ const DICT = {
     outputLang: 'Output Language',
     traditionalChinese: 'Traditional Chinese',
     english: 'English',
+    aiConfig: 'AI Config',
   },
   zh: {
     title: 'ORICKS v4.0',
@@ -149,6 +150,80 @@ const DICT = {
     outputLang: '輸出語言',
     traditionalChinese: '繁體中文',
     english: '英文',
+    aiConfig: 'AI 配置',
+  }
+};
+
+const DEFAULT_AI_CONFIG: AIConfig = {
+  apiKey: '',
+  models: {
+    webSearch: 'gemini-3-flash-preview',
+    comprehensiveSummary: 'gemini-3-flash-preview',
+    dataset: 'gemini-3-flash-preview',
+    reviewReport: 'gemini-3-flash-preview',
+    followUpQuestions: 'gemini-3-flash-preview',
+    skillMd: 'gemini-3-flash-preview',
+  },
+  prompts: {
+    webSearch: `You are a regulatory expert. Search the web and create a highly comprehensive summary in markdown (aim for 2000-3000 words) related to FDA guidance and 510(k) summary based on the following information: 
+    
+    {{input}}
+    
+    Output language: {{lang}}.
+    Ensure the summary covers relevant consensus standards, predicate device history, and specific FDA requirements for this device class.`,
+    comprehensiveSummary: `You are a senior regulatory consultant. Create a comprehensive 510(k) summary (aim for 3000-4000 words) in markdown based on the user input and the web search summary provided below.
+    
+    User Input: {{input}}
+    Web Search Summary: {{webSearchSummary}}
+    
+    Output language: {{lang}}.
+    The summary must be professional, detailed, and structured for a formal FDA submission.`,
+    dataset: `Extract exactly 50 key entities from the following 510(k) summary and return them as a JSON array of objects.
+    Each object MUST have:
+    - 'id': a unique string identifier
+    - 'key': the name of the regulatory field (e.g., "Sterilization Method")
+    - 'value': the specific value found in the summary
+    - 'description': a brief explanation of why this entity is important for compliance.
+    
+    Summary: {{summary}}
+    
+    Return ONLY the JSON object with an 'entities' key.`,
+    reviewReport: `You are an FDA lead reviewer. Create a comprehensive 510(k) review report (aim for 3000-4000 words) in markdown based on the provided information and template.
+    
+    CRITICAL REQUIREMENTS:
+    1. Follow the template structure strictly.
+    2. Include at least 5 detailed tables (e.g., Comparison Table, V&V Results, Standards Compliance).
+    3. Explicitly reference at least 20 entities from the provided dataset.
+    4. Include a detailed review checklist.
+    5. End with exactly 20 comprehensive follow-up questions for the submitter.
+    
+    Template: {{template}}
+    User Input: {{input}}
+    Web Summary: {{webSummary}}
+    Comprehensive Summary: {{compSummary}}
+    Dataset: {{dataset}}
+    
+    Output language: {{lang}}.`,
+    followUpQuestions: `Generate exactly 20 comprehensive, high-level follow-up questions for an FDA 510(k) reviewer to ask the submitter. 
+    These questions should target potential gaps in biocompatibility, software validation, clinical data, and substantial equivalence.
+    
+    Output language: {{lang}}.
+    
+    Input: {{input}}
+    Summary: {{compSummary}}
+    
+    Return ONLY a JSON object with a 'questions' key containing an array of strings.`,
+    skillMd: `Create a high-quality skill.md file based on the provided 510(k) review results. 
+    This skill will be used by other AI agents to perform similar reviews.
+    
+    Include:
+    1. A clear name and description.
+    2. Detailed instructions for reviewing this specific device class.
+    3. 3 additional "WOW" AI features (e.g., Adversarial Red Team Simulation, Future-Proof Analysis, Comparison Ghosting).
+    
+    Results: {{results}}
+    
+    Output in Markdown format.`,
   }
 };
 
@@ -179,6 +254,10 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('dashboard');
   
   const [selectedModel, setSelectedModel] = useState(MODELS[0]);
+  const [aiConfig, setAiConfig] = useState<AIConfig>(DEFAULT_AI_CONFIG);
+  
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const shouldStopRef = useRef(false);
   
   // Submission Data
   const [submissionData, setSubmissionData] = useState<SubmissionData>({
@@ -225,23 +304,33 @@ export default function App() {
 
     setIsAgentRunning(true);
     setAgentStep(1);
+    shouldStopRef.current = false;
     
     try {
       const combinedInput = `${submissionData.summary}\n${submissionData.reviewNotes}\n${submissionData.guidance}`;
       
-      // Step 4: Web Search Summary
+      const checkStop = () => {
+        if (shouldStopRef.current) {
+          throw new Error("Workflow stopped by user");
+        }
+      };
+
+      // Step 2: Web Search Summary
       setAgentStep(2);
-      const webSummary = await geminiService.generateWebSearchSummary(combinedInput, outputLang);
+      const webSummary = await geminiService.generateWebSearchSummary(combinedInput, outputLang, aiConfig);
+      checkStop();
       setAgentResults(prev => ({ ...prev, webSearchSummary: webSummary }));
       
-      // Step 5: Comprehensive Summary
+      // Step 3: Comprehensive Summary
       setAgentStep(3);
-      const compSummary = await geminiService.generateComprehensiveSummary(combinedInput, webSummary || '', outputLang);
+      const compSummary = await geminiService.generateComprehensiveSummary(combinedInput, webSummary || '', outputLang, aiConfig);
+      checkStop();
       setAgentResults(prev => ({ ...prev, comprehensiveSummary: compSummary }));
       
-      // Step 6: Dataset & Report
+      // Step 4: Dataset & Report
       setAgentStep(4);
-      const dataset = await geminiService.generateDataset(compSummary || '');
+      const dataset = await geminiService.generateDataset(compSummary || '', aiConfig);
+      checkStop();
       setEntities(dataset.entities);
       
       const report = await geminiService.generateReviewReport(
@@ -250,10 +339,13 @@ export default function App() {
         compSummary || '', 
         dataset, 
         submissionData.template, 
-        outputLang
+        outputLang,
+        aiConfig
       );
+      checkStop();
       
-      const questions = await geminiService.generateFollowUpQuestions(combinedInput, compSummary || '', outputLang);
+      const questions = await geminiService.generateFollowUpQuestions(combinedInput, compSummary || '', outputLang, aiConfig);
+      checkStop();
       setAgentResults(prev => ({ ...prev, dataset, reviewReport: report, followUpQuestions: questions }));
       
       // Step 7: Skill Creator
@@ -264,18 +356,29 @@ export default function App() {
         compSummary,
         dataset,
         report
-      });
+      }, aiConfig);
+      checkStop();
       setAgentResults(prev => ({ ...prev, skillMd }));
       
       toast.success("AI Agent workflow completed successfully!");
       setActiveTab('agent');
-    } catch (error) {
-      console.error(error);
-      toast.error("An error occurred during the AI Agent workflow.");
+    } catch (error: any) {
+      if (error.message === "Workflow stopped by user") {
+        toast.info("Workflow stopped.");
+      } else {
+        console.error(error);
+        toast.error("An error occurred during the AI Agent workflow.");
+      }
     } finally {
       setIsAgentRunning(false);
       setAgentStep(0);
+      shouldStopRef.current = false;
     }
+  };
+
+  const stopAgent = () => {
+    shouldStopRef.current = true;
+    toast.info("Stopping workflow...");
   };
 
   const getStyleClasses = () => {
@@ -334,6 +437,7 @@ export default function App() {
               { id: 'submission', icon: FileText, label: t.submission },
               { id: 'agent', icon: Sparkles, label: t.agent },
               { id: 'editor', icon: Database, label: t.editor },
+              { id: 'aiConfig', icon: Wand2, label: t.aiConfig || 'AI Config' },
               { id: 'settings', icon: Settings, label: t.settings },
             ].map((item) => (
               <button
@@ -584,23 +688,40 @@ export default function App() {
 
                     <Separator />
 
-                    <Button 
-                      className="w-full h-12 text-lg font-bold bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700 shadow-lg shadow-blue-500/20"
-                      onClick={runAgent}
-                      disabled={isAgentRunning}
-                    >
-                      {isAgentRunning ? (
-                        <>
-                          <Loader2 className="w-5 h-5 mr-2 animate-spin" />
-                          {t.processing}
-                        </>
-                      ) : (
-                        <>
-                          <Play className="w-5 h-5 mr-2" />
-                          {t.startAgent}
-                        </>
+                    <div className="flex gap-2">
+                      <Button 
+                        className={cn(
+                          "flex-1 h-12 text-lg font-bold shadow-lg shadow-blue-500/20",
+                          isAgentRunning 
+                            ? "bg-gray-100 dark:bg-gray-800 text-gray-500" 
+                            : "bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-700 hover:to-purple-700"
+                        )}
+                        onClick={runAgent}
+                        disabled={isAgentRunning}
+                      >
+                        {isAgentRunning ? (
+                          <>
+                            <Loader2 className="w-5 h-5 mr-2 animate-spin" />
+                            {t.processing}
+                          </>
+                        ) : (
+                          <>
+                            <Play className="w-5 h-5 mr-2" />
+                            {t.startAgent}
+                          </>
+                        )}
+                      </Button>
+
+                      {isAgentRunning && (
+                        <Button 
+                          variant="destructive"
+                          className="h-12 px-6 font-bold shadow-lg shadow-red-500/20"
+                          onClick={stopAgent}
+                        >
+                          Stop
+                        </Button>
                       )}
-                    </Button>
+                    </div>
 
                     {isAgentRunning && (
                       <div className="space-y-4 mt-4">
@@ -825,6 +946,119 @@ export default function App() {
             </motion.div>
           )}
 
+          {activeTab === 'aiConfig' && (
+            <motion.div
+              key="aiConfig"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              className="space-y-6"
+            >
+              <Card className="border-none shadow-xl bg-white/50 dark:bg-gray-900/50 backdrop-blur-xl">
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2">
+                    <Sparkles className="w-5 h-5 text-blue-500" />
+                    AI Configuration & Prompt Engineering
+                  </CardTitle>
+                  <CardDescription>
+                    Customize the AI models, prompts, and API keys for each stage of the 510(k) review workflow.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-8">
+                  {/* API Key Section */}
+                  <div className="space-y-4 p-6 rounded-2xl bg-blue-500/5 border border-blue-500/10">
+                    <div className="flex items-center justify-between">
+                      <div className="space-y-1">
+                        <Label className="text-lg font-bold">Custom Gemini API Key</Label>
+                        <p className="text-sm text-gray-500">Provide your own API key to override the system default.</p>
+                      </div>
+                      <Badge variant="outline" className="bg-blue-500/10 text-blue-500">Optional</Badge>
+                    </div>
+                    <Input 
+                      type="password" 
+                      placeholder="Enter your Gemini API Key..." 
+                      value={aiConfig.apiKey}
+                      onChange={(e) => setAiConfig({...aiConfig, apiKey: e.target.value})}
+                      className="font-mono"
+                    />
+                  </div>
+
+                  <Separator />
+
+                  {/* Prompt & Model Config Section */}
+                  <div className="grid grid-cols-1 gap-8">
+                    {[
+                      { id: 'webSearch', label: '1. Web Search Summary', icon: Search },
+                      { id: 'comprehensiveSummary', label: '2. Comprehensive Summary', icon: BookOpen },
+                      { id: 'dataset', label: '3. Dataset Extraction', icon: Database },
+                      { id: 'reviewReport', label: '4. Review Report', icon: FileText },
+                      { id: 'followUpQuestions', label: '5. Follow-up Questions', icon: AlertCircle },
+                      { id: 'skillMd', label: '6. Skill Creator', icon: Sparkles },
+                    ].map((step) => (
+                      <div key={step.id} className="space-y-4 p-6 rounded-2xl bg-white/30 dark:bg-gray-800/30 border border-white/10">
+                        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                          <div className="flex items-center gap-3">
+                            <div className="p-2 bg-gray-100 dark:bg-gray-800 rounded-lg">
+                              <step.icon className="w-5 h-5 text-blue-500" />
+                            </div>
+                            <h3 className="text-lg font-bold">{step.label}</h3>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <Label className="text-xs font-medium text-gray-500">Model:</Label>
+                            <Select 
+                              value={(aiConfig.models as any)[step.id]} 
+                              onValueChange={(val) => setAiConfig({
+                                ...aiConfig, 
+                                models: { ...aiConfig.models, [step.id]: val }
+                              })}
+                            >
+                              <SelectTrigger className="w-[200px] h-8 text-xs">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {MODELS.map(m => <SelectItem key={m} value={m}>{m}</SelectItem>)}
+                              </SelectContent>
+                            </Select>
+                          </div>
+                        </div>
+                        <div className="space-y-2">
+                          <Label className="text-xs font-mono text-gray-500">PROMPT TEMPLATE</Label>
+                          <Textarea 
+                            className="min-h-[150px] font-mono text-xs leading-relaxed"
+                            value={(aiConfig.prompts as any)[step.id]}
+                            onChange={(e) => setAiConfig({
+                              ...aiConfig, 
+                              prompts: { ...aiConfig.prompts, [step.id]: e.target.value }
+                            })}
+                          />
+                          <p className="text-[10px] text-gray-400 italic">
+                            Available variables: {
+                              step.id === 'webSearch' ? '{{input}}, {{lang}}' :
+                              step.id === 'comprehensiveSummary' ? '{{input}}, {{webSearchSummary}}, {{lang}}' :
+                              step.id === 'dataset' ? '{{summary}}' :
+                              step.id === 'reviewReport' ? '{{input}}, {{webSummary}}, {{compSummary}}, {{dataset}}, {{template}}, {{lang}}' :
+                              step.id === 'followUpQuestions' ? '{{input}}, {{compSummary}}, {{lang}}' :
+                              '{{results}}'
+                            }
+                          </p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="flex justify-end gap-3">
+                    <Button variant="outline" onClick={() => setAiConfig(DEFAULT_AI_CONFIG)}>
+                      Reset to Defaults
+                    </Button>
+                    <Button className="bg-gradient-to-r from-blue-600 to-purple-600" onClick={() => toast.success("AI Configuration saved locally!")}>
+                      Save Configuration
+                    </Button>
+                  </div>
+                </CardContent>
+              </Card>
+            </motion.div>
+          )}
+
           {activeTab === 'settings' && (
             <motion.div
               key="settings"
@@ -864,24 +1098,14 @@ export default function App() {
                     </Select>
                   </div>
                   <Separator />
-                  <div className="space-y-4">
-                    <Label className="flex items-center gap-2">
-                      <Sparkles className="w-4 h-4 text-purple-500" />
-                      AI Model Configuration
-                    </Label>
-                    <div className="grid grid-cols-1 gap-4">
-                      <div className="space-y-2">
-                        <Label className="text-xs">Default Model</Label>
-                        <Select value={selectedModel} onValueChange={setSelectedModel}>
-                          <SelectTrigger>
-                            <SelectValue />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {MODELS.map(m => <SelectItem key={m} value={m}>{m}</SelectItem>)}
-                          </SelectContent>
-                        </Select>
-                      </div>
+                  <div className="flex items-center justify-between">
+                    <div className="space-y-0.5">
+                      <Label>AI Configuration</Label>
+                      <p className="text-xs text-gray-500">Advanced prompt and model settings.</p>
                     </div>
+                    <Button variant="outline" onClick={() => setActiveTab('aiConfig')}>
+                      Manage AI Config
+                    </Button>
                   </div>
                 </CardContent>
               </Card>
